@@ -10,6 +10,9 @@ def is_request_test(text: Optional[str]) -> bool:
     """Check whether the doctor requests a medical test."""
     return text is not None and "REQUEST TEST:" in text
 
+def is_intake_complete(text: Optional[str]) -> bool:
+
+    return text is not None and "INTAKE DONE" in text
 
 def is_request_images(text: Optional[str]) -> bool:
     """Check whether the doctor requests medical images."""

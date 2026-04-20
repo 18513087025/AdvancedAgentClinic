@@ -3,7 +3,7 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from core.llm_client import HelloAgentsLLM
+from core.llm_client import AgentsLLM
 
 load_dotenv()
 
@@ -14,7 +14,7 @@ class MeasurementAgent:
         self.information = ""
         self.scenario = scenario
 
-        self.llm = HelloAgentsLLM(
+        self.llm = AgentsLLM(
             model=os.getenv("MEASUREMENT_MODEL_ID"),
             apiKey=os.getenv("MEASUREMENT_API_KEY"),
             baseUrl=os.getenv("MEASUREMENT_BASE_URL"),
@@ -67,4 +67,4 @@ class MeasurementAgent:
 
     def reset(self) -> None:
         self.agent_hist = ""
-        self.information = self.scenario.exam_information()
+        self.information = self.scenario.exam_info

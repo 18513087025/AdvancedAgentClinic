@@ -2,14 +2,14 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from core.llm_client import HelloAgentsLLM
+from core.llm_client import AgentsLLM
 
 load_dotenv()
 
 
 class DiagnosisEvaluator:
     def __init__(self) -> None:
-        self.llm = HelloAgentsLLM(
+        self.llm = AgentsLLM(
             model=os.getenv("MODERATOR_MODEL_ID"),
             apiKey=os.getenv("MODERATOR_API_KEY"),
             baseUrl=os.getenv("MODERATOR_BASE_URL"),
