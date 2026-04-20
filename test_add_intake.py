@@ -127,7 +127,7 @@ def main(
         print(f"{'=' * 80}\n")
 
         
-        # intake 采集信息
+        # intake 采集信息（结构化上下文）
         
         for inf_id in range(max_infs):
             progress = int(((inf_id + 1) / max_infs) * 100)
@@ -154,7 +154,7 @@ def main(
                 case_store.save_json('../dataset/case_store.jsonl') # 保存 case store 的输出
                 break
 
-            
+            # TODO: 如果没有对话模拟，直接给 MedQA 的 question 作为输入
             # TODO: intake 信息采集之后 doctor agent 拿到结构化病历信息，根据病历信息判断诊断难度，输出诊断难度（分三级）
             # 同时输出怀疑的疾病，输出所需的专家，需要输出提示词，以便提取所需专家（这里要改 prompt）
 
