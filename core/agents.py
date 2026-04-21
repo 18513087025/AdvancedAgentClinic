@@ -1,143 +1,187 @@
 import json
-from typing import Any
+
 from core.base_agent import BaseAgent
-from configs import profiles
-import re
+from core.message_store import ChatMessage
+from configs.prompt_builder import build_system_prompt
 
 
-class DoctorAgent(BaseAgent):
-    """
-        system_prompt 开局信息
-    """
-    def __init__(self, scenario, llm_client, max_infs: int = 20, img_processing: bool = False) -> None:
-        super().__init__("doctor", scenario.examiner_info, llm_client, img_processing=img_processing)
-        self.infs = 0
-        self.MAX_INFS = max_infs
-
+class PatientAgent(BaseAgent):
+    def __init__(
+        self,
+        sender,
+        profile,
+        scenario,
+        llm_client,
+        message_store,
+        img_processing: bool = False,
+    ):
+        super().__init__(
+            sender,
+            profile,
+            scenario.examiner_info,
+            llm_client,
+            message_store,
+            img_processing,
+        )
 
     def system_prompt(self) -> str:
-        return profiles.DOCTOR_PROMPT_TEMPLATE.format(
-            MAX_INFS=self.MAX_INFS,
-            infs=self.infs,
-            image_rule=(
-                'You can request test results using the exact format: "REQUEST TEST: [test]". '
-                'For example: "REQUEST TEST: Chest_X-Ray".'
-                if self.img_processing
-                else "You cannot request test results."
-            ), 
-            presentation = self.presentation, 
-        )   
-    
-    def inference(self, response):
-        self.infs += 1
-        return super().inference(response)
+        runtime_info = {
+            "context_title": "CASE SCRIPT",
+            "context": self.context,
+        }
+        return build_system_prompt(self.profile, runtime_info)
 
 
-# ===============================
-class PatientAgent(BaseAgent):
-    def __init__(self, scenario, llm_client) -> None:
-        super().__init__("patient", scenario.patient_info, llm_client)
-    
-    def system_prompt(self):
-        return profiles.PATIENT_PROMPT_TEMPLATE.format(presentation=self.presentation)
-
-# ===============================
 class IntakeAgent(BaseAgent):
-
-    def __init__(self, scenario, llm_client, max_infs: int = 20, img_processing: bool = False) -> None:  # img_processing 是否开启llm的图像分析能力
-        super().__init__("intake", scenario.examiner_info, llm_client, img_processing=img_processing)
+    def __init__(
+        self,
+        sender,
+        profile,
+        scenario,
+        llm_client,
+        message_store,
+        max_intake_turns: int = 5,
+        img_processing: bool = False,
+    ) -> None:
+        super().__init__(
+            sender,
+            profile,
+            scenario.examiner_info,
+            llm_client,
+            message_store,
+            img_processing,
+        )
+        self.max_intake_turns = max_intake_turns
         self.infs = 0
-        self.MAX_INFS = max_infs
-        self._prompt = f"""
-        Now, based on the full dialogue history that you have already collected,
-        organize the patient information into a structured clinical summary.
 
-        Return valid JSON only with the following schema:
-
-        [BEGIN JSON]{{
-        "patient_profile": {{}},
-        "physical_exam": {{}},
-        "labs": {{}},
-        "imaging": {{}},
-        "pathology": {{}}
-        }}[END JSON]
-
-        Do not add any explanation.
-        Do not hallucinate information.
-        
-        Below is the dialogue history you have collected:
-        {self.agent_hist if self.agent_hist else '[No dialogue collected]'}
-        """
-
-    def system_prompt(self):
-        return profiles.INTAKE_PROMPT_TEMPLATE.format( # INTAKE_COMPLETE
-            MAX_TURNS=self.MAX_INFS,
-            turns=self.infs,
-            image_rule=(
+    def system_prompt(self) -> str:
+        runtime_info = {
+            "max_turns": self.max_intake_turns,
+            "turns": self.infs,
+            "image_rule": (
                 "If you believe medical images may be helpful, you should ask the patient whether they can provide prior imaging information such as X-ray, CT, MRI, or ultrasound. "
                 "Only if the patient clearly confirms that such images are available, output exactly \"INTAKE_IMAGE\" and nothing else."
                 if self.img_processing
                 else "You are not allowed to ask the patient about any medical imaging or image-related information."
             ),
-            presentation = self.presentation,
-        )
-    
-    def inference(self, response):
+            "context_title": "TASK OBJECTIVE",
+            "context": self.context,
+        }
+        return build_system_prompt(self.profile, runtime_info)
+
+    def inference(self, window_id: str) -> ChatMessage:
         self.infs += 1
-        return super().inference(response)
-    
+        return super().inference(window_id)
 
-    def extract_json_block(self, text: str):
-        if text is None:
-            return None
+    def finalize_intake(self, case_store, window_id: str) -> None:   # TODO: CaseStore 对象结构设计
+        dialogue_history = self.message_store.get_window_text(window_id)
 
-        match = re.search(r"\[BEGIN JSON\]\s*(\{[\s\S]*?\})\s*\[END JSON\]", text)
+        prompt = f"""
+        Now, based on the full dialogue history, organize the patient information.
+        Return a valid JSON object with the following schema:
 
-        if not match:
-            return None
+        {{
+            "patient_profile": {{}},
+            "physical_exam": {{}},
+            "labs": {{}},
+            "imaging": {{}},
+            "pathology": {{}}
+        }}
 
-        json_str = match.group(1)
+        Strict requirements:
+        - Output ONLY JSON
+        - No explanation
+        - No markdown
+        - No extra text
+
+        Dialogue history:
+        {dialogue_history}
+        """
+
+        messages = [
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "user", "content": prompt},
+        ]
 
         try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            return None
+            answer = self.llm_client.think(messages, temperature=0)
+        except Exception as e:
+            raise RuntimeError(f"[{self.sender}] Intake structured extraction failed: {e}")
 
-        
+        if answer is None:
+            raise ValueError(f"[{self.sender}] Intake structured extraction returned None")
 
+        if not isinstance(answer, str):
+            answer = str(answer)
 
-    def build_structured_patient_info(self, _prompt: str) -> dict[str, Any]:
-        result = self.inference(_prompt)
-        if result is None:
-            return {
-                "patient_profile": {},
-                "physical_exam": {},
-                "labs": {},
-                "imaging": {},
-                "pathology": {},
-            }
+        structured = json.loads(answer)
 
-        try:
-            return self.extract_json_block(result)
-        except json.JSONDecodeError:
-            return {
-                "patient_profile": {},
-                "physical_exam": {},
-                "labs": {},
-                "imaging": {},
-                "pathology": {},
-            }
+        mapping = {
+            "patient_profile": case_store.set_patient_profile, 
+            "physical_exam": case_store.update_physical_exam,
+            "labs": case_store.update_labs,
+            "imaging": case_store.update_imaging,
+            "pathology": case_store.update_pathology,
+        }
 
-    def write_structured_patient_info(self, case_store) -> None:
-        structured = self.build_structured_patient_info(self._prompt)
-        case_store.set_patient_profile(structured.get("patient_profile", {}))
-        case_store.update_physical_exam(structured.get("physical_exam", {}))
-        case_store.update_labs(structured.get("labs", {}))
-        case_store.update_imaging(structured.get("imaging", {}))
-        case_store.update_pathology(structured.get("pathology", {}))
-    
+        for key, func in mapping.items():
+            value = structured.get(key)
+            if not isinstance(value, dict):
+                value = {}
+            func(value)
 
-    
+        case_store.save_json("./outputs/case_store.jsonl")
+        print("Intake complete signal detected. Ending consultation.")
 
 
-    
+class MasterAgent(BaseAgent):
+    def __init__(
+        self,
+        sender,
+        profile,
+        scenario,
+        case_store,
+        llm_client,
+        message_store,
+        max_discuss_turns: int = 5,
+        img_processing: bool = False,
+    ) -> None:
+        super().__init__(
+            sender,
+            profile,
+            scenario.examiner_info,
+            llm_client,
+            message_store,
+            img_processing,
+        )
+        self.max_discuss_turns = max_discuss_turns
+        self.case_store = case_store
+        self.infs = 0
+
+    def _build_case_info(self) -> dict:
+        data = self.case_store.to_dict()
+        return {
+            "case_id": data.get("case_id"),
+            "patient_info": data.get("patient_info", {}),
+            "final_report": data.get("final_report", ""),
+        }
+
+    def system_prompt(self) -> str:
+        runtime_info = {
+            "max_turns": self.max_discuss_turns,
+            "turns": self.infs,
+            "context_title": "TASK OBJECTIVE",
+            "context": self.context,
+            "case_title": "CASE",
+            "case_info": self._build_case_info(),
+            "image_rule": (
+                "If enabled, you may approve image-related measurements requested by specialists."
+                if self.img_processing
+                else "Do not approve image-related measurements."
+            ),
+        }
+        return build_system_prompt(self.profile, runtime_info)
+
+    def inference(self, window_id: str) -> ChatMessage:
+        self.infs += 1
+        return super().inference(window_id)
