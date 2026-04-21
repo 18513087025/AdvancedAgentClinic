@@ -136,7 +136,7 @@ def patient_say(
     patient_agent,
     window_id: str,
 ):
-    if inf_type == "human_patient":
+    if inf_type == "human_patient":  # human input 需要将消息加入 message store
         patient_text = input("\nPatient: ")
         return patient_agent.message_store.append_message(
             window_id=window_id,
@@ -168,7 +168,7 @@ def run_intake_phase(
         print(f"Intake [{progress}%]: {intake_msg.content}")
         time.sleep(sleep_time)
 
-        if is_intake_complete(intake_msg.content):
+        if intake_msg.metadata.get("intake_done"):
             intake_agent.finalize_intake(case_store, window_id)
             return
 
@@ -180,7 +180,7 @@ def run_intake_phase(
         print(f"Patient [{progress}%]: {patient_msg.content}")
         time.sleep(sleep_time)
 
-    intake_agent.finalize_intake(case_store, window_id)
+    intake_agent.finalize_intake(case_store, window_id) # 兜底结束
 
 
 def run_master_phase(

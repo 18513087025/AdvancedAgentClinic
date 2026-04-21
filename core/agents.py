@@ -71,53 +71,100 @@ class IntakeAgent(BaseAgent):
 
     def inference(self, window_id: str) -> ChatMessage:
         self.infs += 1
-        return super().inference(window_id)
+        msg = super().inference(window_id)
 
-    def finalize_intake(self, case_store, window_id: str) -> None:   # TODO: CaseStore 对象结构设计
+        done = "INTAKE DONE" in msg.content
+        msg.metadata["intake_done"] = done
+
+        return msg
+
+    def finalize_intake(self, case_store, window_id: str) -> None:
         dialogue_history = self.message_store.get_window_text(window_id)
 
-        prompt = f"""
-        Now, based on the full dialogue history, organize the patient information.
-        Return a valid JSON object with the following schema:
+        base_prompt = f"""
+            Now, based on the full dialogue history, organize the patient information.
+            Return a valid JSON object with the following schema:
 
-        {{
-            "patient_profile": {{}},
-            "physical_exam": {{}},
-            "labs": {{}},
-            "imaging": {{}},
-            "pathology": {{}}
-        }}
+            {{
+                "patient_profile": {{}},
+                "physical_exam": {{}},
+                "labs": {{}},
+                "imaging": {{}},
+                "pathology": {{}}
+            }}
 
-        Strict requirements:
-        - Output ONLY JSON
-        - No explanation
-        - No markdown
-        - No extra text
+            Strict requirements:
+            - Output ONLY JSON
+            - No explanation
+            - No markdown
+            - No extra text
 
-        Dialogue history:
-        {dialogue_history}
-        """
+            Dialogue history:
+            {dialogue_history}
+            """
 
         messages = [
             {"role": "system", "content": self.system_prompt()},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": base_prompt},
         ]
 
-        try:
-            answer = self.llm_client.think(messages, temperature=0)
-        except Exception as e:
-            raise RuntimeError(f"[{self.sender}] Intake structured extraction failed: {e}")
+        max_retries = 2
+        answer = None
 
-        if answer is None:
-            raise ValueError(f"[{self.sender}] Intake structured extraction returned None")
+        for retry_id in range(max_retries + 1):
+            try:
+                answer = self.llm_client.think(messages, temperature=0)
+            except Exception as e:
+                if retry_id == max_retries:
+                    raise RuntimeError(f"[{self.sender}] Intake structured extraction failed: {e}")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response failed. "
+                        "Please strictly follow the output format and return VALID JSON ONLY."
+                    ),
+                })
+                continue
 
-        if not isinstance(answer, str):
-            answer = str(answer)
+            if answer is None:
+                if retry_id == max_retries:
+                    raise ValueError(f"[{self.sender}] Intake structured extraction returned None")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was empty. "
+                        "Please strictly follow the output format and return VALID JSON ONLY."
+                    ),
+                })
+                continue
 
-        structured = json.loads(answer)
+            if not isinstance(answer, str):
+                answer = str(answer)
+
+            try:
+                structured = json.loads(answer)
+                break
+            except json.JSONDecodeError:
+                if retry_id == max_retries:
+                    raise ValueError(
+                        f"[{self.sender}] Intake structured extraction failed: invalid JSON\n{answer}"
+                    )
+                messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was not valid JSON. "
+                        "Please strictly follow the output format and return ONLY a valid JSON object."
+                    ),
+                })
+        else:
+            raise ValueError(f"[{self.sender}] Intake structured extraction failed after retries")
 
         mapping = {
-            "patient_profile": case_store.set_patient_profile, 
+            "patient_profile": case_store.set_patient_profile,
             "physical_exam": case_store.update_physical_exam,
             "labs": case_store.update_labs,
             "imaging": case_store.update_imaging,
@@ -130,11 +177,16 @@ class IntakeAgent(BaseAgent):
                 value = {}
             func(value)
 
-        case_store.save_json("./outputs/case_store.jsonl")
+        case_store.save_json("./dataset/case_store.jsonl")
         print("Intake complete signal detected. Ending consultation.")
 
 
 class MasterAgent(BaseAgent):
+
+    # direct_finalize
+        # → 继续走单医生 / 单主控模式
+        # initiate_specialist_discussion
+        # → 系统切换到多专家模式
     def __init__(
         self,
         sender,
