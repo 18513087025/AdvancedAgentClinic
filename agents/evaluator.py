@@ -7,7 +7,7 @@ from core.llm_client import AgentsLLM
 load_dotenv()
 
 
-class DiagnosisEvaluator:
+class EvaluatorAgent:
     def __init__(self) -> None:
         self.llm = AgentsLLM(
             model=os.getenv("MODERATOR_MODEL_ID"),

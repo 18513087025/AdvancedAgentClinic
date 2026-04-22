@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 
 
@@ -26,3 +27,17 @@ def extract_final_diagnosis(doctor_text: str) -> str:
         return doctor_text.split("DIAGNOSIS READY:", 1)[1].strip()
 
     return doctor_text.strip()
+
+
+
+
+def try_parse_json(text: str):
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        data = json.loads(text)
+
+        return data
+    except json.JSONDecodeError:
+        return None
+    return None

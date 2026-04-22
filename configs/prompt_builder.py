@@ -117,5 +117,17 @@ def build_system_prompt(
             "[REMINDER]",
             str(reminder),
         ])
+#     if runtime_info.get("is_last_turn"):
+#         extra_rule = """
+#         IMPORTANT:
+#         This is the FINAL discussion turn.
+
+#         You MUST do one of the following:
+#         - If evidence is sufficient → output FINAL JSON
+#         - If evidence is insufficient → STILL output your BEST possible structured JSON
+
+#         DO NOT continue discussion.
+#         DO NOT ask more questions.
+#           """
 
     return "\n".join(parts).strip()

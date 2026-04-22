@@ -11,7 +11,7 @@
 # 一个“聊天窗口”只是消息的一个视图，不一定真的拷贝消息。
 # 3. EventBus / Pipe
 # agent 之间不直接互调，而是通过事件或管道发送消息。
-# 4. Orchestrator
+# 4. Orchestrator  TODO: 目前没有调度器、真正的 Orchestrator 类（带 routing + policy）
 # 主控循环。负责调度哪个 agent 读哪个窗口、往哪个窗口发消息。
 
 
@@ -22,6 +22,22 @@ from core.message_store import ChatMessage
 
 
 class BaseAgent(ABC):
+
+    """
+        Base class for all agents in the multi-agent system.
+
+        Handles:
+        - Dialogue context retrieval (from MessageStore)
+        - Prompt construction (system + history + latest message)
+        - LLM inference
+        - Writing responses back to the shared message store
+
+        Notes:
+        - Agents do not store history locally (stateless design)
+        - window_id controls which conversation context is used
+        - Subclasses must define system_prompt()
+    """
+     
     def __init__(
         self,
         sender: str,

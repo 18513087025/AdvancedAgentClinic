@@ -1,140 +1,114 @@
-
-
 import argparse
 import json
+import os
 import time
 from typing import Optional
-import os
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from core import agents
+from configs import profiles
+
+from core.system import initialize_system
 from core.case_store import CaseStore
 from core.message_store import MessageStore
 from core.llm_client import AgentsLLM
-from configs import profiles
 
-from utils.scenario_loader import ScenarioLoader
+from agents.patient import PatientAgent
+from agents.intake import IntakeAgent
+from agents.router import RouterAgent
+from agents.primarydoctor import PrimoryDoctorAgent
+from agents.measurement import MeasurementAgent
+from agents.specialists import SpecialistAgent
+from agents.coordinator import CoordinatorAgent
 
 
-
-def initialize_system(
-    dataset: str,
-    num_scenarios: Optional[int] = None,
-    inf_type: str = "llm",
-    max_intake_turns: int = 5,
-    max_discuss_turns: int = 5,
-    img_processing: bool = False,
-    sleep_time: float = 1.0,
-) -> dict:
-    scenario_loader = ScenarioLoader(dataset)
-
-    if num_scenarios is None:
-        num_scenarios = scenario_loader.num_scenarios
-
-    max_cases = min(num_scenarios, scenario_loader.num_scenarios)
-
-    # 先统一复用同一个 LLM 池
-    agent_prefixes = ["MASTER", "PATIENT", "INTAKE", "SPECIALIST", "MEASUREMENT"]
-
-    llms = {
-        name.lower(): AgentsLLM(
-            os.getenv("MODEL_ID"),
-            os.getenv("API_KEY"),
-            os.getenv("BASE_URL"),
-        )
-        for name in agent_prefixes
-    }
-
-    runtime_config = {
-        "inf_type": inf_type,
-        "max_intake_turns": max_intake_turns,
-        "max_discuss_turns": max_discuss_turns,
-        "img_processing": img_processing,
-        "sleep_time": sleep_time,
-        "dataset": dataset,
-        "num_scenarios": num_scenarios,
-    }
-
-    return {
-        "scenario_loader": scenario_loader,
-        "max_cases": max_cases,
-        "llms": llms,
-        "master_llm": llms["master"],
-        "patient_llm": llms["patient"],
-        "intake_llm": llms["intake"],
-        "specialist_llm": llms["specialist"],
-        "measurement_llm": llms["measurement"],
-        "runtime_config": runtime_config,
-    }
+def append_case_store_jsonl(
+    case_store: CaseStore,
+    path: str = "./output/case_store.jsonl",
+) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(case_store.to_dict(), ensure_ascii=False) + "\n")
 
 
 def build_case_agents(
     scenario,
     case_store: CaseStore,
     message_store: MessageStore,
-    patient_llm,
-    intake_llm,
-    master_llm,
+    llms: dict,
     max_intake_turns: int,
     max_discuss_turns: int,
     img_processing: bool,
 ):
-    patient_agent = agents.PatientAgent(
+    patient_agent = PatientAgent(
         sender="PATIENT",
         profile=profiles.PATIENT_PROFILE,
         scenario=scenario,
-        llm_client=patient_llm,
+        llm_client=llms["patient"],
         message_store=message_store,
         img_processing=img_processing,
     )
 
-    intake_agent = agents.IntakeAgent(
+    intake_agent = IntakeAgent(
         sender="INTAKE",
         profile=profiles.INTAKE_PROFILE,
         scenario=scenario,
-        llm_client=intake_llm,
+        llm_client=llms["intake"],
         message_store=message_store,
         max_intake_turns=max_intake_turns,
         img_processing=img_processing,
     )
 
-    # 这里复用 MasterAgent 类，分别挂不同 profile
-    router_agent = agents.MasterAgent(
-        sender="MASTER_ROUTER",
-        profile=profiles.MASTER_ROUTER_PROFILE,
+    router_agent = RouterAgent(
+        sender="ROUTER",
+        profile=profiles.ROUTER_PROFILE,
         scenario=scenario,
         case_store=case_store,
-        llm_client=master_llm,
+        llm_client=llms["master"],
         message_store=message_store,
-        max_discuss_turns=1,
         img_processing=img_processing,
     )
 
-    single_doctor_agent = agents.MasterAgent(
-        sender="MASTER_DOCTOR",
-        profile=profiles.MASTER_SINGLE_DOCTOR_PROFILE,
+    doctor_agent = PrimoryDoctorAgent(
+        sender="DOCTOR",
+        profile=profiles.DOCTOR_PROFILE,
         scenario=scenario,
-        case_store=case_store,
-        llm_client=master_llm,
+        llm_client=llms["master"],
         message_store=message_store,
-        max_discuss_turns=max_discuss_turns,
+        case_store=case_store,
+        max_discussion_turns=max_discuss_turns,
         img_processing=img_processing,
     )
 
-    coordinator_agent = agents.MasterAgent(
-        sender="MASTER_COORDINATOR",
-        profile=profiles.MASTER_COORDINATOR_PROFILE,
+    measurement_agent = MeasurementAgent(
+        sender="MEASUREMENT",
+        profile=profiles.MEASUREMENT_PROFILE,
         scenario=scenario,
-        case_store=case_store,
-        llm_client=master_llm,
+        llm_client=llms["measurement"],
         message_store=message_store,
-        max_discuss_turns=1,
         img_processing=img_processing,
     )
 
-    return patient_agent, intake_agent, router_agent, single_doctor_agent, coordinator_agent
+    coordinator_agent = CoordinatorAgent(
+        sender="COORDINATOR",
+        profile=profiles.COORDINATOR_PROFILE,
+        scenario=scenario,
+        case_store=case_store,
+        llm_client=llms["master"],
+        message_store=message_store,
+        max_discussion_turns=max_discuss_turns,
+        img_processing=img_processing,
+    )
+
+    return (
+        patient_agent,
+        intake_agent,
+        router_agent,
+        doctor_agent,
+        measurement_agent,
+        coordinator_agent,
+    )
 
 
 def build_specialist_agents(
@@ -143,30 +117,31 @@ def build_specialist_agents(
     message_store: MessageStore,
     specialist_llm,
     specialties: list[str],
+    max_discuss_turns: int,
     img_processing: bool,
 ):
     specialist_agents = {}
 
     for specialty in specialties:
-        specialist_agents[specialty] = agents.MasterAgent(
+        specialist_agents[specialty] = SpecialistAgent(
             sender=f"{specialty.upper()}_SPECIALIST",
             profile=profiles.build_specialist_profile(specialty),
             scenario=scenario,
             case_store=case_store,
             llm_client=specialist_llm,
             message_store=message_store,
-            max_discuss_turns=1,
+            specialty=specialty,
+            max_discussion_turns=max_discuss_turns,
             img_processing=img_processing,
         )
 
     return specialist_agents
 
 
-def create_case_windows(message_store: MessageStore, specialties: list[str] | None = None) -> dict[str, str]:
-    intake_window_id = "intake_patient_window"
-    router_window_id = "router_window"
+def create_case_windows(message_store: MessageStore) -> dict[str, str]:
+    intake_window_id = "intake_window"
     single_doctor_window_id = "single_doctor_window"
-    coordinator_window_id = "coordinator_window"
+    discussion_window_id = "discussion_window"
 
     message_store.create_window(
         window_id=intake_window_id,
@@ -175,41 +150,34 @@ def create_case_windows(message_store: MessageStore, specialties: list[str] | No
     )
 
     message_store.create_window(
-        window_id=router_window_id,
-        title="Router Decision",
-        participants=["MASTER_ROUTER"],
-    )
-
-    message_store.create_window(
         window_id=single_doctor_window_id,
         title="Single Doctor Reasoning",
-        participants=["MASTER_DOCTOR", "MEASUREMENT"],
+        participants=["DOCTOR", "MEASUREMENT"],
     )
 
     message_store.create_window(
-        window_id=coordinator_window_id,
-        title="Coordinator Summary",
-        participants=["MASTER_COORDINATOR"],
+        window_id=discussion_window_id,
+        title="Specialist Discussion",
+        participants=["ROUTER", "COORDINATOR", "MEASUREMENT"],
     )
-
-    specialist_window_ids = {}
-    specialties = specialties or []
-    for specialty in specialties:
-        wid = f"{specialty}_specialist_window"
-        specialist_window_ids[specialty] = wid
-        message_store.create_window(
-            window_id=wid,
-            title=f"{specialty.capitalize()} Specialist Discussion",
-            participants=[f"{specialty.upper()}_SPECIALIST", "MEASUREMENT"],
-        )
 
     return {
         "intake_window_id": intake_window_id,
-        "router_window_id": router_window_id,
         "single_doctor_window_id": single_doctor_window_id,
-        "coordinator_window_id": coordinator_window_id,
-        "specialist_window_ids": specialist_window_ids,
+        "discussion_window_id": discussion_window_id,
     }
+
+
+def add_specialists_to_discussion_window(
+    message_store: MessageStore,
+    window_id: str,
+    specialties: list[str],
+) -> None:
+    window = message_store.windows[window_id]
+    for specialty in specialties:
+        participant = f"{specialty.upper()}_SPECIALIST"
+        if participant not in window.participants:
+            window.participants.append(participant)
 
 
 def patient_say(
@@ -225,11 +193,6 @@ def patient_say(
             content=patient_text,
         )
     return patient_agent.inference(window_id)
-
-
-def parse_json_from_message(content: str) -> dict:
-    content = content.strip()
-    return json.loads(content)
 
 
 def run_intake_phase(
@@ -254,8 +217,11 @@ def run_intake_phase(
         print(f"Intake [{progress}%]: {intake_msg.content}")
         time.sleep(sleep_time)
 
-        if intake_msg.metadata.get("intake_done"):
-            intake_agent.finalize_intake(case_store, window_id)
+        if intake_msg.metadata.get("done"):
+            print(f"\n{'=' * 30}")
+            print("[Intake Complete]")
+            print(f"{'=' * 30}")
+            case_store.update_patient_info(intake_msg.metadata["structured_data"])
             return
 
         patient_msg = patient_say(
@@ -266,129 +232,209 @@ def run_intake_phase(
         print(f"Patient [{progress}%]: {patient_msg.content}")
         time.sleep(sleep_time)
 
-    intake_agent.finalize_intake(case_store, window_id)
-
 
 def run_router_phase(router_agent, window_id: str, sleep_time: float) -> dict:
     router_agent.message_store.append_message(
         window_id=window_id,
         sender="SYSTEM",
-        content="Review the structured case and decide whether to continue on the single-doctor path or initiate specialist discussion.",
+        content=(
+            "Review the structured case and decide whether to continue on the "
+            "single-doctor path or initiate specialist discussion."
+        ),
     )
 
     router_msg = router_agent.inference(window_id)
     print(f"Router: {router_msg.content}")
+    print(f"\n{'=' * 30}")
+    print("[Routing Complete]")
+    print(f"{'=' * 30}")
     time.sleep(sleep_time)
 
-    return parse_json_from_message(router_msg.content)
+    return router_msg.metadata["structured_data"]
 
 
-def handle_measurement_request(request_text: str) -> str:
-    # 这里先给你一个测试版占位实现
-    # 后面你接 MeasurementAgent / scenario data 时再替换
-    if "REQUEST TEST:" in request_text:
-        test_name = request_text.replace("REQUEST TEST:", "").strip()
-        return f"RESULTS: {test_name} = NORMAL READINGS"
-    return "RESULTS: NORMAL READINGS"
+def run_measurement_step(
+    measurement_agent,
+    case_store: CaseStore,
+    window_id: str,
+    test_name: str,
+    sleep_time: float,
+) -> dict:
+    measurement_msg = measurement_agent.inference(window_id)
+    if measurement_msg is None:
+        return {}
+
+    result = measurement_msg.metadata["structured_data"]
+    case_store.update_measurement(test_name, result)
+
+    if isinstance(result, dict):
+        category = result.get("category")
+        patch = result.get("patient_info_update")
+
+        if isinstance(category, str) and isinstance(patch, dict):
+            try:
+                case_store.update_patient_info_from_measurement(category, patch)
+            except ValueError:
+                pass
+
+    print(f"Measurement: {measurement_msg.content}")
+    print("[Measurement Complete]")
+    time.sleep(sleep_time)
+
+    return result
+
+
+def maybe_run_measurement(
+    measurement_agent,
+    case_store: CaseStore,
+    window_id: str,
+    sleep_time: float,
+) -> dict:
+    measurement_msg = measurement_agent.inference(window_id)
+    if measurement_msg is None:
+        return {}
+
+    result = measurement_msg.metadata["structured_data"]
+
+    history = measurement_agent.message_store.get_window_messages(window_id)
+    test_name = "unknown_test"
+    if len(history) >= 2:
+        request_text = (history[-2].content or "").strip()
+        if "REQUEST TEST:" in request_text.upper():
+            test_name = request_text.split(":", 1)[1].strip()
+
+    case_store.update_measurement(test_name, result)
+
+    if isinstance(result, dict):
+        category = result.get("category")
+        patch = result.get("patient_info_update")
+
+        if isinstance(category, str) and isinstance(patch, dict):
+            try:
+                case_store.update_patient_info_from_measurement(category, patch)
+            except ValueError:
+                pass
+
+    print(f"Measurement: {measurement_msg.content}")
+    print("[Measurement Complete]")
+    time.sleep(sleep_time)
+
+    return result
 
 
 def run_single_doctor_phase(
-    single_doctor_agent,
+    doctor_agent,
+    measurement_agent,
+    case_store: CaseStore,
     window_id: str,
     max_discuss_turns: int,
     sleep_time: float,
-) -> str:
-    single_doctor_agent.message_store.append_message(
+) -> dict:
+    doctor_agent.message_store.append_message(
         window_id=window_id,
         sender="SYSTEM",
-        content="Review the structured case and continue diagnosis. If needed, request tests. If ready, output DIAGNOSIS READY.",
+        content=(
+            "Review the structured case and continue diagnosis. "
+            "If needed, request tests using the required format. "
+            "If ready, output the final diagnosis JSON."
+        ),
     )
 
-    final_diagnosis = ""
-
     for inf_id in range(max_discuss_turns):
-        msg = single_doctor_agent.inference(window_id)
+        msg = doctor_agent.inference(window_id)
         print(f"SingleDoctor [{inf_id + 1}/{max_discuss_turns}]: {msg.content}")
         time.sleep(sleep_time)
 
-        if msg.content.startswith("REQUEST TEST:"):
-            result_text = handle_measurement_request(msg.content)
-            single_doctor_agent.message_store.append_message(
+        output_type = msg.metadata.get("output_type")
+
+        if output_type == "request_test":
+            test_name = msg.metadata["structured_data"]["test_request"]
+            run_measurement_step(
+                measurement_agent=measurement_agent,
+                case_store=case_store,
                 window_id=window_id,
-                sender="MEASUREMENT",
-                content=result_text,
+                test_name=test_name,
+                sleep_time=sleep_time,
             )
-            print(f"Measurement: {result_text}")
-            time.sleep(sleep_time)
             continue
 
-        if msg.content.startswith("DIAGNOSIS READY:"):
-            final_diagnosis = msg.content.replace("DIAGNOSIS READY:", "").strip()
-            break
+        if output_type == "final_diagnosis":
+            print(f"\n{'=' * 30}")
+            print("[Single Doctor Diagnosis Complete]")
+            print(f"{'=' * 30}")
+            return msg.metadata["structured_data"]
 
-    return final_diagnosis
+    return {}
 
 
 def run_specialist_phase(
     specialist_agents: dict,
-    specialist_window_ids: dict[str, str],
+    measurement_agent,
+    case_store: CaseStore,
+    window_id: str,
     max_discuss_turns: int,
     sleep_time: float,
-) -> list[dict]:
-    specialist_outputs = []
+) -> dict:
+    specialist_outputs = {}
 
     for specialty, specialist_agent in specialist_agents.items():
-        window_id = specialist_window_ids[specialty]
-
         specialist_agent.message_store.append_message(
             window_id=window_id,
             sender="SYSTEM",
-            content="Review the structured case, provide specialist evidence, and recommend additional tests if needed.",
+            content=(
+                "Review the structured case and join the discussion. "
+                "When ready, output your final specialist opinion JSON."
+            ),
         )
 
-        last_content = ""
+        final_opinion = None
+
         for inf_id in range(max_discuss_turns):
             msg = specialist_agent.inference(window_id)
-            last_content = msg.content
-            print(f"{specialty.capitalize()} Specialist [{inf_id + 1}/{max_discuss_turns}]: {msg.content}")
+            print(
+                f"{specialty.capitalize()} Specialist "
+                f"[{inf_id + 1}/{max_discuss_turns}]: {msg.content}"
+            )
             time.sleep(sleep_time)
 
-            if "THAT IS ALL" in msg.content:
+            # 主动尝试触发 measurement
+            maybe_run_measurement(
+                measurement_agent=measurement_agent,
+                case_store=case_store,
+                window_id=window_id,
+                sleep_time=sleep_time,
+            )
+
+            output_type = msg.metadata.get("output_type")
+
+            if output_type == "discussion":
+                continue
+
+            if output_type == "final_opinion":
+                print(f"\n[{specialty.capitalize()} Specialist Complete]")
+                final_opinion = msg.metadata["structured_data"]
+                case_store.update_specialist_opinion(specialty, final_opinion)
                 break
 
-            # 简单处理专家建议检查：主程序代为执行 measurement
-            json_part = msg.content.replace("THAT IS ALL", "").strip()
-            try:
-                data = json.loads(json_part)
-            except Exception:
-                data = {}
+        if final_opinion is None:
+            continue
 
-            for test_name in data.get("recommended_measurements", []):
-                result_text = f"RESULTS: {test_name} = NORMAL READINGS"
-                specialist_agent.message_store.append_message(
-                    window_id=window_id,
-                    sender="MEASUREMENT",
-                    content=result_text,
-                )
-                print(f"Measurement for {specialty}: {result_text}")
-                time.sleep(sleep_time)
+        specialist_outputs[specialty] = final_opinion
 
-        json_part = last_content.replace("THAT IS ALL", "").strip()
-        try:
-            specialist_outputs.append(json.loads(json_part))
-        except Exception:
-            specialist_outputs.append({
-                "specialist": specialty,
-                "opinion": "",
-                "supporting_evidence": [],
-                "recommended_measurements": [],
-                "confidence": "low",
-            })
+    print(f"\n{'=' * 30}")
+    print("[Specialist Discussion Complete]")
+    print(f"{'=' * 30}")
 
     return specialist_outputs
 
 
-def run_coordinator_phase(coordinator_agent, window_id: str, sleep_time: float) -> dict:
+def run_coordinator_phase(
+    coordinator_agent,
+    measurement_agent,
+    case_store: CaseStore,
+    window_id: str,
+    sleep_time: float,
+) -> dict:
     coordinator_agent.message_store.append_message(
         window_id=window_id,
         sender="SYSTEM",
@@ -397,39 +443,58 @@ def run_coordinator_phase(coordinator_agent, window_id: str, sleep_time: float) 
 
     msg = coordinator_agent.inference(window_id)
     print(f"Coordinator: {msg.content}")
+
+    # 主动尝试触发 measurement
+    maybe_run_measurement(
+        measurement_agent=measurement_agent,
+        case_store=case_store,
+        window_id=window_id,
+        sleep_time=sleep_time,
+    )
+
+    print(f"\n{'=' * 30}")
+    print("[Coordinator Complete]")
+    print(f"{'=' * 30}")
     time.sleep(sleep_time)
 
-    return parse_json_from_message(msg.content)
+    final_report = msg.metadata["structured_data"]
+    case_store.update_final_report(final_report)
+    return final_report
 
 
 def run_single_case(
     scenario_id: int,
     scenario,
-    patient_llm,
-    intake_llm,
-    master_llm,
-    specialist_llm,
+    llms: dict,
     runtime_config: dict,
 ):
-    sleep_time = runtime_config["sleep_time"]
-    max_intake_turns = runtime_config["max_intake_turns"]
-    max_discuss_turns = runtime_config["max_discuss_turns"]
-    img_processing = runtime_config["img_processing"]
-    inf_type = runtime_config["inf_type"]
+    inference_config = runtime_config["inference"]
+    system_config = runtime_config["system"]
+
+    sleep_time = system_config["sleep_time"]
+    img_processing = system_config["img_processing"]
+
+    inf_type = inference_config["type"]
+    max_intake_turns = inference_config["max_intake_turns"]
+    max_discuss_turns = inference_config["max_discuss_turns"]
 
     case_store = CaseStore(str(scenario_id))
     message_store = MessageStore()
 
-    # 先建基础窗口
     window_ids = create_case_windows(message_store)
 
-    patient_agent, intake_agent, router_agent, single_doctor_agent, coordinator_agent = build_case_agents(
+    (
+        patient_agent,
+        intake_agent,
+        router_agent,
+        doctor_agent,
+        measurement_agent,
+        coordinator_agent,
+    ) = build_case_agents(
         scenario=scenario,
         case_store=case_store,
         message_store=message_store,
-        patient_llm=patient_llm,
-        intake_llm=intake_llm,
-        master_llm=master_llm,
+        llms=llms,
         max_intake_turns=max_intake_turns,
         max_discuss_turns=max_discuss_turns,
         img_processing=img_processing,
@@ -455,67 +520,77 @@ def run_single_case(
 
     router_result = run_router_phase(
         router_agent=router_agent,
-        window_id=window_ids["router_window_id"],
+        window_id=window_ids["discussion_window_id"],
         sleep_time=sleep_time,
     )
+    case_store.update_triage(router_result)
 
     final_result = None
 
     if router_result["next_action"] == "single_doctor":
-        final_diagnosis = run_single_doctor_phase(
-            single_doctor_agent=single_doctor_agent,
+        final_result = run_single_doctor_phase(
+            doctor_agent=doctor_agent,
+            measurement_agent=measurement_agent,
+            case_store=case_store,
             window_id=window_ids["single_doctor_window_id"],
             max_discuss_turns=max_discuss_turns,
             sleep_time=sleep_time,
         )
-        final_result = {
-            "final_diagnosis": final_diagnosis,
-            "path": "single_doctor",
-        }
+        case_store.update_final_report(final_result)
 
     elif router_result["next_action"] == "initiate_specialist_discussion":
         specialties = router_result.get("required_specialists", [])
-        # 重新创建专家窗口
-        specialist_window_ids = {}
-        for specialty in specialties:
-            wid = f"{specialty}_specialist_window"
-            specialist_window_ids[specialty] = wid
-            message_store.create_window(
-                window_id=wid,
-                title=f"{specialty.capitalize()} Specialist Discussion",
-                participants=[f"{specialty.upper()}_SPECIALIST", "MEASUREMENT"],
-            )
+
+        add_specialists_to_discussion_window(
+            message_store=message_store,
+            window_id=window_ids["discussion_window_id"],
+            specialties=specialties,
+        )
 
         specialist_agents = build_specialist_agents(
             scenario=scenario,
             case_store=case_store,
             message_store=message_store,
-            specialist_llm=specialist_llm,
+            specialist_llm=llms["specialist"],
             specialties=specialties,
+            max_discuss_turns=max_discuss_turns,
             img_processing=img_processing,
         )
 
         specialist_outputs = run_specialist_phase(
             specialist_agents=specialist_agents,
-            specialist_window_ids=specialist_window_ids,
+            measurement_agent=measurement_agent,
+            case_store=case_store,
+            window_id=window_ids["discussion_window_id"],
             max_discuss_turns=max_discuss_turns,
             sleep_time=sleep_time,
         )
 
-        # 暂时把专家输出写到 final_report 前的中间结果里，后面你可以单独扩 CaseStore
-        case_store.data["specialist_outputs"] = specialist_outputs
+        print("\n[Specialist Opinions]")
+        print(json.dumps(specialist_outputs, ensure_ascii=False, indent=2))
 
         final_result = run_coordinator_phase(
             coordinator_agent=coordinator_agent,
-            window_id=window_ids["coordinator_window_id"],
+            measurement_agent=measurement_agent,
+            case_store=case_store,
+            window_id=window_ids["discussion_window_id"],
             sleep_time=sleep_time,
         )
 
     else:
-        raise ValueError(f"Unknown next_action: {router_result['next_action']}")
+        return {
+            "case_store": case_store,
+            "message_store": message_store,
+            "router_result": router_result,
+            "final_result": {},
+        }
 
-    print("\n[Final Result]")
+    print(f"\n{'=' * 30}")
+    print("[Final Result]")
+    print(f"{'=' * 30}")
     print(json.dumps(final_result, ensure_ascii=False, indent=2))
+
+    append_case_store_jsonl(case_store, "./output/case_store.jsonl")
 
     return {
         "case_store": case_store,
@@ -528,30 +603,45 @@ def run_single_case(
 def main(
     inf_type: str = "llm",
     dataset: str = "MedQA",
-    num_scenarios: Optional[int] = None,
+    num_scenarios: Optional[int] = 1,
     max_intake_turns: int = 5,
     max_discuss_turns: int = 5,
     img_processing: bool = False,
 ):
-    system_state = initialize_system(
+    llms = {
+        name: AgentsLLM(
+            os.getenv("MODEL_ID"),
+            os.getenv("API_KEY"),
+            os.getenv("BASE_URL"),
+        )
+        for name in [
+            "master",
+            "patient",
+            "intake",
+            "specialist",
+            "measurement",
+            "evaluator",
+        ]
+    }
+
+    system = initialize_system(
         dataset=dataset,
-        num_scenarios=num_scenarios,
+        llms=llms,
         inf_type=inf_type,
         max_intake_turns=max_intake_turns,
         max_discuss_turns=max_discuss_turns,
         img_processing=img_processing,
         sleep_time=1.0,
+        num_scenarios=num_scenarios,
     )
 
-    scenario_loader = system_state["scenario_loader"]
-    max_cases = system_state["max_cases"]
+    os.makedirs("./output", exist_ok=True)
+    with open("./output/case_store.jsonl", "w", encoding="utf-8") as f:
+        pass
 
-    patient_llm = system_state["patient_llm"]
-    intake_llm = system_state["intake_llm"]
-    master_llm = system_state["master_llm"]
-    specialist_llm = system_state["specialist_llm"]
-
-    runtime_config = system_state["runtime_config"]
+    scenario_loader = system.scenario_loader
+    max_cases = system.max_cases
+    runtime_config = system.runtime_config
 
     for scenario_id in range(max_cases):
         scenario = scenario_loader.get_scenario(id=scenario_id)
@@ -559,16 +649,15 @@ def main(
         run_single_case(
             scenario_id=scenario_id,
             scenario=scenario,
-            patient_llm=patient_llm,
-            intake_llm=intake_llm,
-            master_llm=master_llm,
-            specialist_llm=specialist_llm,
+            llms=llms,
             runtime_config=runtime_config,
         )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multi-Agent Medical Diagnosis Simulation System")
+    parser = argparse.ArgumentParser(
+        description="Multi-Agent Medical Diagnosis Simulation System"
+    )
 
     parser.add_argument(
         "--inf_type",
@@ -580,7 +669,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--img_processing",
         action="store_true",
-        help="Enable the doctor to request medical images (if available in the dataset).",
+        help="Enable asking about medical images when supported.",
     )
     parser.add_argument(
         "--num_scenarios",
@@ -607,6 +696,7 @@ if __name__ == "__main__":
         choices=["MedQA", "MedQA_Ext", "NEJM", "NEJM_Ext", "MIMICIV"],
         help="Dataset to use for simulation.",
     )
+
     args = parser.parse_args()
 
     main(
