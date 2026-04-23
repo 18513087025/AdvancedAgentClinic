@@ -32,31 +32,43 @@ class SpecialistAgent(BaseAgent):
         self.case_store = case_store
 
     def system_prompt(self) -> str:
-        # is_last_turn = (self.infs + 1) >= self.max_discussion_turns
         runtime_info = {
             "max_turns": self.max_discussion_turns,
             "turns": self.infs,
             "context_title": "TASK OBJECTIVE",
             "context": self.context,
             "case_info": self.case_store.to_dict()["patient_info"],
-            # "is_last_turn": is_last_turn,
         }
         return build_system_prompt(self.profile, runtime_info)
 
     def inference(self, window_id: str) -> ChatMessage:
         MAX_RETRIES = 2
+        last_content = ""
 
         for retry in range(MAX_RETRIES + 1):
             msg = super().inference(window_id)
             content = (msg.content or "").strip()
+            last_content = content
 
-            # ===== 如果不是 JSON → 当作讨论 =====
+            # ===== 1. REQUEST TEST =====
+            if "REQUEST TEST" in content.upper():
+                test_name = content.split(":", 1)[1].strip()
+
+                msg.metadata["output_type"] = "request_test"
+                msg.metadata["structured_data"] = {
+                    "specialist": self.specialty,
+                    "test_request": test_name,
+                }
+                msg.metadata["done"] = False
+                return msg
+
+            # ===== 2. 普通文本讨论 =====
             if not (content.startswith("{") and content.endswith("}")):
                 msg.metadata["output_type"] = "discussion"
                 msg.metadata["done"] = False
                 return msg
 
-            # ===== 是 JSON → 尝试解析 final opinion =====
+            # ===== 3. JSON -> final opinion =====
             try:
                 parsed_json = json.loads(content)
                 if isinstance(parsed_json, dict):
@@ -67,17 +79,19 @@ class SpecialistAgent(BaseAgent):
             except json.JSONDecodeError:
                 pass
 
-            # ===== JSON坏了 → retry =====
+            # ===== 4. JSON 格式坏了，重试 =====
             if retry < MAX_RETRIES:
                 self.message_store.add_message(
                     window_id,
                     ChatMessage(
-                        sender="system",
+                        sender="SYSTEM",
                         content=(
                             "Your previous response was invalid.\n"
-                            "You must return ONLY a valid JSON object.\n"
-                            "Do NOT include any text before or after the JSON.\n"
-                            "The JSON must strictly follow the required schema:\n"
+                            "You must output one of the following only:\n"
+                            "1. A normal discussion sentence or paragraph; OR\n"
+                            "2. A test request in the exact format: REQUEST TEST: [test_name]; OR\n"
+                            "3. A valid JSON object for your final opinion.\n\n"
+                            "If you output JSON, it must strictly follow this schema:\n"
                             "{\n"
                             f'  "specialist": "{self.specialty}",\n'
                             '  "opinion": "",\n'
@@ -88,12 +102,13 @@ class SpecialistAgent(BaseAgent):
                             '      "confidence": "low | medium | high"\n'
                             "    }\n"
                             "  ]\n"
-                            "}"
+                            "}\n"
+                            "Do not include any extra text before or after the JSON."
                         ),
                     ),
                 )
 
         raise ValueError(
-            f"[{self.sender}] Failed to produce valid specialist JSON after retries.\n"
-            f"Last output:\n{content}"
+            f"[{self.sender}] Failed to produce valid specialist output after retries.\n"
+            f"Last output:\n{last_content}"
         )

@@ -28,11 +28,7 @@ class MeasurementAgent(BaseAgent):
         runtime_info = {
             "context_title": "AVAILABLE MEASUREMENT DATA",
             "contex": self.context, 
-            # "context": json.dumps(
-            #     self.context,
-            #     ensure_ascii=False,
-            #     indent=2,
-            # ),
+      
         }
         return build_system_prompt(self.profile, runtime_info)
   
@@ -40,17 +36,6 @@ class MeasurementAgent(BaseAgent):
     def inference(self, window_id: str) -> ChatMessage:
 
         MAX_RETRIES = 2
-
-        history = self.message_store.get_window_messages(window_id)
-
-        if not history:
-            return None
-
-        last_msg = history[-1]
-        last_content = (last_msg.content or "").strip()
-
-        if "REQUEST TEST" not in last_content.upper():
-            return None  # 不是检测请求，直接不处理
 
         for retry in range(MAX_RETRIES + 1):
             msg = super().inference(window_id)
@@ -68,17 +53,17 @@ class MeasurementAgent(BaseAgent):
                     pass
 
             if retry < MAX_RETRIES:
-                self.message_store.add_message(
-                    window_id,
-                    ChatMessage(
-                        sender="system",
-                        content=(
-                            "Your previous response was invalid.\n"
-                            "You must return ONLY a valid JSON object.\n"
-                            "Do NOT include any text before or after the JSON.\n"
-                            "The JSON must strictly follow the required schema."
-                        ),
+                self.message_store.append_message(
+                    window_id=window_id,
+                    sender="SYSTEM",
+                    
+                    content=(
+                        "Your previous response was invalid.\n"
+                        "You must return ONLY a valid JSON object.\n"
+                        "Do NOT include any text before or after the JSON.\n"
+                        "The JSON must strictly follow the required schema."
                     ),
+                    
                 )
 
         raise ValueError(

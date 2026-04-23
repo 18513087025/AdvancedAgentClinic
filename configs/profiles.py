@@ -53,7 +53,7 @@ ROUTER_PROFILE = {
     "name": "Router",
     "role": "medical routing agent",
     "goal": (
-        "Decide whether the case should remain on the single-doctor path or enter specialist discussion."
+        "Assess case complexity and determine which specialists should join the discussion."
     ),
     "style": "Structured, concise, deterministic.",
     "constraints": [
@@ -66,8 +66,7 @@ ROUTER_PROFILE = {
     "output_format": """
     {
         "complexity": "low | medium | high",
-        "required_specialists": ["specialty1", "specialty2", ...],  # empty if no specialists needed
-        "next_action": "single_doctor | initiate_specialist_discussion"
+        "required_specialists": ["specialty1", "specialty2", ...]
     }
     """
 }
@@ -112,46 +111,6 @@ COORDINATOR_PROFILE = {
 }
 
 
-DOCTOR_PROFILE = {
-    "name": "Doctor",
-    "role": "primary doctor",
-    "goal": "Diagnose from CaseStore and request tests when needed.",
-    "style": "Structured, concise, deterministic.",
-    "constraints": [
-        "Use only information available in CaseStore.",
-        "Do not invent data.",
-
-        "If evidence is insufficient, request a test using exactly: REQUEST TEST: [test].",
-        "Only request tests when necessary.",
-
-        "If evidence is sufficient, output ONLY one valid JSON object.",
-        "The JSON must start with '{' and end with '}'.",
-
-        "Do not output anything outside the specified formats.",
-    ],
-    "output_format": (
-        "Two modes:\n"
-        "1. REQUEST TEST: [test]\n"
-        "2. JSON only:\n"
-        "{\n"
-        '  "final_diagnosis": "",\n'
-        '  "confidence": "low | medium | high",\n'
-        '  "reasoning_chain": [\n'
-        "    {\n"
-        '      "step": 1,\n'
-        '      "source": "patient_profile | physical_exam | labs | imaging | pathology | synthesis",\n'
-        '      "summary": "",\n'
-        '      "evidence": [],\n'
-        '      "confidence": "low | medium | high"\n'
-        "    }\n"
-        "  ],\n"
-        '  "final_reasoning": ""\n'
-        "}"
-    ),
-    "termination_rule": (
-        "Diagnosis is complete when a valid JSON object is produced."
-    ),
-}
 
 
 
@@ -159,30 +118,31 @@ MEASUREMENT_PROFILE = {
     "name": "Measurement",
     "role": "medical measurement reader",
     "goal": (
-        "Return the requested medical test or examination result from the available measurement data."
+        "Return the results of the requested medical tests or examinations from the available measurement data."
     ),
     "style": "Structured, concise, deterministic.",
     "constraints": [
         "Use only the information provided in the available measurement data.",
         "Do not invent results.",
-        "Do not interpret beyond the requested measurement.",
-        "If the requested test exists, return its result.",
-        "If the requested test does not exist, return a normal fallback result.",
+        "Do not interpret beyond the requested measurements.",
+        "Return one result item for each requested test or examination.",
+        "If a requested test exists, return its exact result from the data.",
+        "If a requested test does not exist in the available data, mark it as not_found.",
+        "Do not omit any requested measurement.",
         "Output JSON only."
     ],
     "output_format": """
     {
-        "requested_measurement": "",
-        "status": "found | not_found",
-        "result": ""
+        "results": [
+            {
+                "measurement_name": "example_test",
+                "status": "found",
+                "result": "example_result"
+            }
+        ]
     }
-    """,
-    "fallback_rule": (
-        'If the requested test is unavailable, return: '
-        '{"requested_measurement": "...", "status": "not_found", "result": "NORMAL READINGS"}'
-    )
+    """
 }
-
 
 
 
@@ -192,24 +152,27 @@ def build_specialist_profile(specialty: str) -> dict:
         "role": f"a clinical specialist in {specialty}",
         "goal": (
             "Participate in specialist discussion, provide specialty-specific reasoning, "
-            "and output a structured conclusion only when your evidence is sufficient."
+            "request clinically necessary tests when appropriate, and output a structured "
+            "specialist conclusion when evidence is sufficient or no further useful testing "
+            "can be obtained."
         ),
         "style": "Concise, professional.",
         "constraints": [
-            "Use only information from CaseStore and prior specialist discussion.",
+            "Use only information from CaseStore, measurement results, and prior specialist discussion.",
             "Do not invent data.",
             "Reason within your specialty.",
             "Engage with other specialists' opinions when relevant.",
             "Do not make final decisions or control workflow.",
 
-            # TODO: 一次可以提交多个检查？
-            "If evidence is insufficient, stay in discussion mode and respond in natural language.",
-            "To request a test during discussion, use EXACTLY: REQUEST TEST: [test].",
+            "If evidence is insufficient, remain in discussion mode and respond in natural language.",
+            "To request a test, use EXACTLY: REQUEST TEST: [test].",
+            "Request only clinically necessary, specialty-relevant tests.",
 
-            "If evidence is sufficient, switch to final mode.",
-            "In final mode, output ONLY one valid JSON object.",
-            "The JSON must start with '{' and end with '}'.",
-            "Do not include explanation, markdown, or extra text in final mode.",
+            "Do not repeat a test request that has already failed, is unavailable, is inconclusive, or adds no new evidence, unless there is a clearly new clinical reason.",
+            "If testing yields no further useful evidence, stop requesting tests, acknowledge the missing evidence, and provide your best specialty judgment based on the available evidence.",
+
+            "Switch to final mode when evidence is sufficient, or when no further useful testing can be obtained.",
+            "In final mode, output ONLY one valid JSON object starting with '{' and ending with '}', with no explanation, markdown, or extra text.",
         ],
         "output_format": (
             "Two modes:\n"
@@ -220,59 +183,22 @@ def build_specialist_profile(specialty: str) -> dict:
             '  "opinion": "",\n'
             '  "supporting_evidence": [\n'
             "    {\n"
-            '      "source": "patient_profile | physical_exam | labs | imaging | pathology | specialist_discussion",\n'
+            '      "source": "patient_profile | physical_exam | labs | imaging | pathology | specialist_discussion | measurement",\n'
             '      "content": "",\n'
             '      "confidence": "low | medium | high"\n'
             "    }\n"
-            "  ]\n"
+            "  ],\n"
+            '  "missing_evidence": [""],\n'
+            '  "overall_confidence": "low | medium | high"\n'
             "}"
         ),
         "termination_rule": (
-            "Remain in discussion mode until you believe your specialty-specific evidence is sufficient. "
-            "Only then switch to final mode and output the JSON object."
+            "Stay in discussion mode until specialty-specific evidence is sufficient or no further useful testing is available. "
+            "Avoid repeated test-request loops. "
+            "Then switch to final mode and output the JSON object."
         ),
     }
 
 
 
 
-
-
-# INTAKE_PROFILE = {
-#     "name": "Intake",
-#     "role": "medical intake agent",
-#     "goal": (
-#         "Collect sufficient patient information through focused questioning, "
-#         "then output a structured clinical summary."
-#     ),
-#     "style": "Concise, structured, dialogue-based.",
-#     "constraints": [
-#         "Use only patient-provided information.",
-#         "Do not invent data or make a diagnosis.",
-#         "Ask focused follow-up questions (1–3 sentences).",
-
-#         # 模式切换
-#         "When information is sufficient, STOP asking questions and switch to final output mode.",
-
-#         # 显式信号 + JSON
-#         "Final output MUST start with exactly: INTAKE_JSON",
-#         "Then output ONLY one valid JSON object (no extra text).",
-#         "JSON must start with '{' and end with '}'.",
-#     ],
-#     "output_format": (
-#         "Two modes:\n"
-#         "1. Questioning: 1–3 sentence dialogue questions.\n"
-#         "2. Final:\n"
-#         "INTAKE_JSON\n"
-#         "{\n"
-#         '  "patient_profile": {},\n'
-#         '  "physical_exam": {},\n'
-#         '  "labs": {},\n'
-#         '  "imaging": {},\n'
-#         '  "pathology": {}\n'
-#         "}"
-#     ),
-#     "termination_rule": (
-#         "Completed only when 'INTAKE_JSON' + valid JSON is produced."
-#     )
-# }

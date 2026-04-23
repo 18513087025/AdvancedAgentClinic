@@ -5,6 +5,7 @@ import time
 from typing import Optional
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from configs import profiles
@@ -17,7 +18,6 @@ from core.llm_client import AgentsLLM
 from agents.patient import PatientAgent
 from agents.intake import IntakeAgent
 from agents.router import RouterAgent
-from agents.primarydoctor import PrimoryDoctorAgent
 from agents.measurement import MeasurementAgent
 from agents.specialists import SpecialistAgent
 from agents.coordinator import CoordinatorAgent
@@ -70,17 +70,6 @@ def build_case_agents(
         img_processing=img_processing,
     )
 
-    doctor_agent = PrimoryDoctorAgent(
-        sender="DOCTOR",
-        profile=profiles.DOCTOR_PROFILE,
-        scenario=scenario,
-        llm_client=llms["master"],
-        message_store=message_store,
-        case_store=case_store,
-        max_discussion_turns=max_discuss_turns,
-        img_processing=img_processing,
-    )
-
     measurement_agent = MeasurementAgent(
         sender="MEASUREMENT",
         profile=profiles.MEASUREMENT_PROFILE,
@@ -105,7 +94,6 @@ def build_case_agents(
         patient_agent,
         intake_agent,
         router_agent,
-        doctor_agent,
         measurement_agent,
         coordinator_agent,
     )
@@ -140,30 +128,22 @@ def build_specialist_agents(
 
 def create_case_windows(message_store: MessageStore) -> dict[str, str]:
     intake_window_id = "intake_window"
-    single_doctor_window_id = "single_doctor_window"
     discussion_window_id = "discussion_window"
 
     message_store.create_window(
         window_id=intake_window_id,
         title="Intake-Patient Dialogue",
-        participants=["INTAKE", "PATIENT"],
-    )
-
-    message_store.create_window(
-        window_id=single_doctor_window_id,
-        title="Single Doctor Reasoning",
-        participants=["DOCTOR", "MEASUREMENT"],
+        participants=["SYSTEM", "INTAKE", "PATIENT"],
     )
 
     message_store.create_window(
         window_id=discussion_window_id,
         title="Specialist Discussion",
-        participants=["ROUTER", "COORDINATOR", "MEASUREMENT"],
+        participants=["SYSTEM", "ROUTER", "MEASUREMENT"],
     )
 
     return {
         "intake_window_id": intake_window_id,
-        "single_doctor_window_id": single_doctor_window_id,
         "discussion_window_id": discussion_window_id,
     }
 
@@ -238,8 +218,8 @@ def run_router_phase(router_agent, window_id: str, sleep_time: float) -> dict:
         window_id=window_id,
         sender="SYSTEM",
         content=(
-            "Review the structured case and decide whether to continue on the "
-            "single-doctor path or initiate specialist discussion."
+            "Review the structured case, assess complexity, and determine which "
+            "specialists should join the discussion."
         ),
     )
 
@@ -259,115 +239,77 @@ def run_measurement_step(
     window_id: str,
     test_name: str,
     sleep_time: float,
+    requester: str = "UNKNOWN",
 ) -> dict:
-    measurement_msg = measurement_agent.inference(window_id)
-    if measurement_msg is None:
-        return {}
-
-    result = measurement_msg.metadata["structured_data"]
-    case_store.update_measurement(test_name, result)
-
-    if isinstance(result, dict):
-        category = result.get("category")
-        patch = result.get("patient_info_update")
-
-        if isinstance(category, str) and isinstance(patch, dict):
-            try:
-                case_store.update_patient_info_from_measurement(category, patch)
-            except ValueError:
-                pass
-
-    print(f"Measurement: {measurement_msg.content}")
-    print("[Measurement Complete]")
-    time.sleep(sleep_time)
-
-    return result
-
-
-def maybe_run_measurement(
-    measurement_agent,
-    case_store: CaseStore,
-    window_id: str,
-    sleep_time: float,
-) -> dict:
-    measurement_msg = measurement_agent.inference(window_id)
-    if measurement_msg is None:
-        return {}
-
-    result = measurement_msg.metadata["structured_data"]
-
-    history = measurement_agent.message_store.get_window_messages(window_id)
-    test_name = "unknown_test"
-    if len(history) >= 2:
-        request_text = (history[-2].content or "").strip()
-        if "REQUEST TEST:" in request_text.upper():
-            test_name = request_text.split(":", 1)[1].strip()
-
-    case_store.update_measurement(test_name, result)
-
-    if isinstance(result, dict):
-        category = result.get("category")
-        patch = result.get("patient_info_update")
-
-        if isinstance(category, str) and isinstance(patch, dict):
-            try:
-                case_store.update_patient_info_from_measurement(category, patch)
-            except ValueError:
-                pass
-
-    print(f"Measurement: {measurement_msg.content}")
-    print("[Measurement Complete]")
-    time.sleep(sleep_time)
-
-    return result
-
-
-def run_single_doctor_phase(
-    doctor_agent,
-    measurement_agent,
-    case_store: CaseStore,
-    window_id: str,
-    max_discuss_turns: int,
-    sleep_time: float,
-) -> dict:
-    doctor_agent.message_store.append_message(
+    measurement_agent.message_store.append_message(
         window_id=window_id,
         sender="SYSTEM",
         content=(
-            "Review the structured case and continue diagnosis. "
-            "If needed, request tests using the required format. "
-            "If ready, output the final diagnosis JSON."
+            f"A test has been requested by {requester}. "
+            f"Please process this request and return the measurement result for: {test_name}"
         ),
     )
 
-    for inf_id in range(max_discuss_turns):
-        msg = doctor_agent.inference(window_id)
-        print(f"SingleDoctor [{inf_id + 1}/{max_discuss_turns}]: {msg.content}")
-        time.sleep(sleep_time)
+    measurement_msg = measurement_agent.inference(window_id)
+    if measurement_msg is None:
+        return {}
 
-        output_type = msg.metadata.get("output_type")
+    result = measurement_msg.metadata.get("structured_data", {})
+    case_store.update_measurement(test_name, result)
 
-        if output_type == "request_test":
-            test_name = msg.metadata["structured_data"]["test_request"]
-            run_measurement_step(
-                measurement_agent=measurement_agent,
-                case_store=case_store,
-                window_id=window_id,
-                test_name=test_name,
-                sleep_time=sleep_time,
-            )
-            continue
+    if isinstance(result, dict):
+        category = result.get("category")
+        patch = result.get("patient_info_update")
 
-        if output_type == "final_diagnosis":
-            print(f"\n{'=' * 30}")
-            print("[Single Doctor Diagnosis Complete]")
-            print(f"{'=' * 30}")
-            return msg.metadata["structured_data"]
+        if isinstance(category, str) and isinstance(patch, dict):
+            try:
+                case_store.update_patient_info_from_measurement(category, patch)
+            except ValueError:
+                pass
 
-    return {}
+    print(f"Measurement ({requester} requested): {measurement_msg.content}")
+    print("[Measurement Complete]")
+    time.sleep(sleep_time)
+
+    return result
 
 
-def run_specialist_phase(
+def build_discussion_order(
+    specialist_agents: dict,
+) -> list[tuple[str, object]]:
+    speakers = []
+
+    for specialty, agent in specialist_agents.items():
+        speakers.append((specialty, agent))
+
+    return speakers
+
+
+def prime_discussion_context(
+    specialist_agents: dict,
+    window_id: str,
+) -> None:
+    shared_prompt = (
+        "This is a multi-agent specialist discussion. "
+        "You must read and respond to previous messages from other specialists. "
+        "Do not ignore prior specialist comments. "
+        "You may do one of the following in each turn:\n"
+        "1. Provide discussion / critique / agreement / disagreement.\n"
+        "2. Request a test using the exact format: REQUEST TEST: [test_name]\n"
+        "3. Output final JSON only when your view is stable and sufficiently supported.\n"
+        "Discussion quality matters: explicitly reference or react to other specialists when relevant."
+    )
+
+    if specialist_agents:
+        any_agent = next(iter(specialist_agents.values()))
+        any_agent.message_store.append_message(
+            window_id=window_id,
+            sender="SYSTEM",
+            content=shared_prompt,
+        )
+
+
+def run_discussion_phase(
     specialist_agents: dict,
     measurement_agent,
     case_store: CaseStore,
@@ -376,50 +318,67 @@ def run_specialist_phase(
     sleep_time: float,
 ) -> dict:
     specialist_outputs = {}
+    finished_specialists: set[str] = set()
 
-    for specialty, specialist_agent in specialist_agents.items():
-        specialist_agent.message_store.append_message(
-            window_id=window_id,
-            sender="SYSTEM",
-            content=(
-                "Review the structured case and join the discussion. "
-                "When ready, output your final specialist opinion JSON."
-            ),
-        )
+    prime_discussion_context(
+        specialist_agents=specialist_agents,
+        window_id=window_id,
+    )
 
-        final_opinion = None
+    speakers = build_discussion_order(
+        specialist_agents=specialist_agents,
+    )
 
-        for inf_id in range(max_discuss_turns):
-            msg = specialist_agent.inference(window_id)
-            print(
-                f"{specialty.capitalize()} Specialist "
-                f"[{inf_id + 1}/{max_discuss_turns}]: {msg.content}"
-            )
+    for round_id in range(max_discuss_turns):
+        print(f"\n{'=' * 30}")
+        print(f"[Discussion Round {round_id + 1}]")
+        print(f"{'=' * 30}")
+
+        anyone_spoke = False
+
+        for speaker_name, speaker_agent in speakers:
+            if speaker_name in finished_specialists:
+                continue
+
+            msg = speaker_agent.inference(window_id)
+            if msg is None:
+                continue
+
+            anyone_spoke = True
+
+            print(f"{speaker_name.capitalize()} Specialist [Round {round_id + 1}]: {msg.content}")
             time.sleep(sleep_time)
 
-            # 主动尝试触发 measurement
-            maybe_run_measurement(
-                measurement_agent=measurement_agent,
-                case_store=case_store,
-                window_id=window_id,
-                sleep_time=sleep_time,
-            )
-
             output_type = msg.metadata.get("output_type")
+
+            if output_type == "request_test":
+                test_name = msg.metadata["structured_data"]["test_request"]
+                run_measurement_step(
+                    measurement_agent=measurement_agent,
+                    case_store=case_store,
+                    window_id=window_id,
+                    test_name=test_name,
+                    sleep_time=sleep_time,
+                    requester=speaker_name,
+                )
+                continue
 
             if output_type == "discussion":
                 continue
 
             if output_type == "final_opinion":
-                print(f"\n[{specialty.capitalize()} Specialist Complete]")
                 final_opinion = msg.metadata["structured_data"]
-                case_store.update_specialist_opinion(specialty, final_opinion)
-                break
+                specialist_outputs[speaker_name] = final_opinion
+                case_store.update_specialist_opinion(speaker_name, final_opinion)
+                finished_specialists.add(speaker_name)
+                print(f"\n[{speaker_name.capitalize()} Specialist Complete]")
+                continue
 
-        if final_opinion is None:
-            continue
+        if not anyone_spoke:
+            break
 
-        specialist_outputs[specialty] = final_opinion
+        if len(finished_specialists) == len(specialist_agents):
+            break
 
     print(f"\n{'=' * 30}")
     print("[Specialist Discussion Complete]")
@@ -430,36 +389,48 @@ def run_specialist_phase(
 
 def run_coordinator_phase(
     coordinator_agent,
-    measurement_agent,
     case_store: CaseStore,
     window_id: str,
+    max_discuss_turns: int,
     sleep_time: float,
 ) -> dict:
+    if case_store.to_dict().get("final_report"):
+        return case_store.to_dict()["final_report"]
+
     coordinator_agent.message_store.append_message(
         window_id=window_id,
         sender="SYSTEM",
-        content="Summarize all available specialist evidence and output the final diagnosis JSON.",
+        content=(
+            "All specialist discussions have ended. "
+            "Now summarize the structured case and finalized specialist opinions, "
+            "then output the final diagnosis JSON."
+        ),
     )
 
-    msg = coordinator_agent.inference(window_id)
-    print(f"Coordinator: {msg.content}")
+    for inf_id in range(max_discuss_turns):
+        msg = coordinator_agent.inference(window_id)
+        if msg is None:
+            continue
 
-    # 主动尝试触发 measurement
-    maybe_run_measurement(
-        measurement_agent=measurement_agent,
-        case_store=case_store,
-        window_id=window_id,
-        sleep_time=sleep_time,
-    )
+        print(f"Coordinator [{inf_id + 1}/{max_discuss_turns}]: {msg.content}")
+        time.sleep(sleep_time)
 
-    print(f"\n{'=' * 30}")
-    print("[Coordinator Complete]")
-    print(f"{'=' * 30}")
-    time.sleep(sleep_time)
+        output_type = msg.metadata.get("output_type")
 
-    final_report = msg.metadata["structured_data"]
-    case_store.update_final_report(final_report)
-    return final_report
+        if output_type == "discussion":
+            continue
+
+        if output_type == "final_report":
+            final_report = msg.metadata["structured_data"]
+            case_store.update_final_report(final_report)
+
+            print(f"\n{'=' * 30}")
+            print("[Coordinator Complete]")
+            print(f"{'=' * 30}")
+
+            return final_report
+
+    return {}
 
 
 def run_single_case(
@@ -487,7 +458,6 @@ def run_single_case(
         patient_agent,
         intake_agent,
         router_agent,
-        doctor_agent,
         measurement_agent,
         coordinator_agent,
     ) = build_case_agents(
@@ -525,65 +495,43 @@ def run_single_case(
     )
     case_store.update_triage(router_result)
 
-    final_result = None
+    specialties = router_result.get("required_specialists", [])
 
-    if router_result["next_action"] == "single_doctor":
-        final_result = run_single_doctor_phase(
-            doctor_agent=doctor_agent,
-            measurement_agent=measurement_agent,
-            case_store=case_store,
-            window_id=window_ids["single_doctor_window_id"],
-            max_discuss_turns=max_discuss_turns,
-            sleep_time=sleep_time,
-        )
-        case_store.update_final_report(final_result)
+    add_specialists_to_discussion_window(
+        message_store=message_store,
+        window_id=window_ids["discussion_window_id"],
+        specialties=specialties,
+    )
 
-    elif router_result["next_action"] == "initiate_specialist_discussion":
-        specialties = router_result.get("required_specialists", [])
+    specialist_agents = build_specialist_agents(
+        scenario=scenario,
+        case_store=case_store,
+        message_store=message_store,
+        specialist_llm=llms["specialist"],
+        specialties=specialties,
+        max_discuss_turns=max_discuss_turns,
+        img_processing=img_processing,
+    )
 
-        add_specialists_to_discussion_window(
-            message_store=message_store,
-            window_id=window_ids["discussion_window_id"],
-            specialties=specialties,
-        )
+    specialist_outputs = run_discussion_phase(
+        specialist_agents=specialist_agents,
+        measurement_agent=measurement_agent,
+        case_store=case_store,
+        window_id=window_ids["discussion_window_id"],
+        max_discuss_turns=max_discuss_turns,
+        sleep_time=sleep_time,
+    )
 
-        specialist_agents = build_specialist_agents(
-            scenario=scenario,
-            case_store=case_store,
-            message_store=message_store,
-            specialist_llm=llms["specialist"],
-            specialties=specialties,
-            max_discuss_turns=max_discuss_turns,
-            img_processing=img_processing,
-        )
+    print("\n[Specialist Opinions]")
+    print(json.dumps(specialist_outputs, ensure_ascii=False, indent=2))
 
-        specialist_outputs = run_specialist_phase(
-            specialist_agents=specialist_agents,
-            measurement_agent=measurement_agent,
-            case_store=case_store,
-            window_id=window_ids["discussion_window_id"],
-            max_discuss_turns=max_discuss_turns,
-            sleep_time=sleep_time,
-        )
-
-        print("\n[Specialist Opinions]")
-        print(json.dumps(specialist_outputs, ensure_ascii=False, indent=2))
-
-        final_result = run_coordinator_phase(
-            coordinator_agent=coordinator_agent,
-            measurement_agent=measurement_agent,
-            case_store=case_store,
-            window_id=window_ids["discussion_window_id"],
-            sleep_time=sleep_time,
-        )
-
-    else:
-        return {
-            "case_store": case_store,
-            "message_store": message_store,
-            "router_result": router_result,
-            "final_result": {},
-        }
+    final_result = run_coordinator_phase(
+        coordinator_agent=coordinator_agent,
+        case_store=case_store,
+        window_id=window_ids["discussion_window_id"],
+        max_discuss_turns=max_discuss_turns,
+        sleep_time=sleep_time,
+    )
 
     print(f"\n{'=' * 30}")
     print("[Final Result]")
@@ -596,6 +544,7 @@ def run_single_case(
         "case_store": case_store,
         "message_store": message_store,
         "router_result": router_result,
+        "specialist_outputs": specialist_outputs,
         "final_result": final_result,
     }
 
@@ -687,7 +636,7 @@ if __name__ == "__main__":
         "--max_discuss_turns",
         type=int,
         default=5,
-        help="Maximum number of doctor/specialist reasoning turns.",
+        help="Maximum number of specialist/coordinator reasoning turns.",
     )
     parser.add_argument(
         "--agent_dataset",
